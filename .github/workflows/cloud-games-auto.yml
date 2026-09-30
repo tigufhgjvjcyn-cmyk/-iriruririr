@@ -1,0 +1,153 @@
+name: ☁️ Cloud Games Bot - Auto RDP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Thời gian mỗi phiên'
+        required: false
+        default: '5h30m'
+        type: choice
+        options: ['1h', '3h', '5h30m']
+      auto_restart:
+        description: 'Tự chạy phiên tiếp theo'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: cloud-games-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: windows-latest
+    timeout-minutes: 340
+    env:
+      DURATION: ${{ inputs.duration || '5h30m' }}
+      AUTO_RESTART: ${{ inputs.auto_restart || 'true' }}
+
+    steps:
+      - name: 📥 Lấy toàn bộ mã nguồn Cloud Games Bot
+        uses: actions/checkout@v4
+
+      - name: 🔎 Tìm thư mục bot
+        id: locate
+        shell: pwsh
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          $package = Get-ChildItem -Path $root -Filter package.json -Recurse -File |
+            Where-Object { Test-Path (Join-Path $_.Directory.FullName 'src/index.js') } |
+            Select-Object -First 1
+
+          if (-not $package) {
+            throw "Không tìm thấy package.json + src/index.js. Hãy upload TOÀN BỘ source Cloud Games Bot vào repository."
+          }
+
+          $botDir = $package.Directory.FullName
+          "BOT_DIR=$botDir" >> $env:GITHUB_ENV
+          Write-Host "✅ Bot directory: $botDir"
+          Write-Host "📄 package.json: $($package.FullName)"
+
+      - name: 🟢 Cài Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 📦 Cài dependencies
+        shell: pwsh
+        working-directory: ${{ env.BOT_DIR }}
+        run: |
+          npm install
+          if ($LASTEXITCODE -ne 0) { throw "npm install thất bại" }
+          npm run check
+          if ($LASTEXITCODE -ne 0) { throw "Kiểm tra src/index.js thất bại" }
+
+      - name: ⚙️ Kiểm tra .env có sẵn
+        shell: pwsh
+        working-directory: ${{ env.BOT_DIR }}
+        run: |
+          $envFile = Join-Path (Get-Location) '.env'
+          if (-not (Test-Path $envFile)) {
+            throw "Không tìm thấy .env tại $envFile. Hãy đưa file .env có sẵn của bot vào repository. Không cần GitHub Secrets."
+          }
+          $envText = Get-Content $envFile -Raw
+          foreach ($key in @('DISCORD_TOKEN','CLIENT_ID')) {
+            if ($envText -notmatch "(?m)^\s*$key\s*=\s*.+") {
+              throw "Thiếu $key trong .env"
+            }
+          }
+          Write-Host '✅ Đã tìm thấy .env và các biến bắt buộc.'
+
+      - name: ▶️ Tự động chạy Cloud Games Bot
+        id: bot
+        shell: pwsh
+        working-directory: ${{ env.BOT_DIR }}
+        run: |
+          $minutes = 330
+          if ($env:DURATION -match '^(?:(\d+)h)?(?:(\d+)m)?$') {
+            $h = if ($Matches[1]) { [int]$Matches[1] } else { 0 }
+            $m = if ($Matches[2]) { [int]$Matches[2] } else { 0 }
+            if (($h * 60 + $m) -gt 0) { $minutes = $h * 60 + $m }
+          }
+          $minutes = [math]::Min($minutes, 335)
+          $end = [DateTimeOffset]::UtcNow.AddMinutes($minutes)
+          $outLog = Join-Path $env:TEMP 'cloud-games.out.log'
+          $errLog = Join-Path $env:TEMP 'cloud-games.err.log'
+
+          function Start-Bot {
+            Write-Host '🚀 Khởi động Cloud Games Bot...'
+            return Start-Process -FilePath 'npm.cmd' -ArgumentList 'start' -WorkingDirectory (Get-Location).Path -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+          }
+
+          $proc = Start-Bot
+          Start-Sleep -Seconds 10
+          if ($proc.HasExited) {
+            Write-Host '❌ Bot thoát ngay sau khi khởi động.'
+            Get-Content $outLog -Tail 100 -ErrorAction SilentlyContinue
+            Get-Content $errLog -Tail 100 -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          Write-Host "☁️ CLOUD GAMES BOT ĐANG CHẠY - $minutes phút"
+          $lastLog = [DateTimeOffset]::UtcNow
+          while ([DateTimeOffset]::UtcNow -lt $end) {
+            if ($proc.HasExited) {
+              Write-Host '⚠️ Bot đã dừng - tự động khởi động lại sau 5 giây...'
+              Start-Sleep -Seconds 5
+              $proc = Start-Bot
+              Start-Sleep -Seconds 5
+            }
+            if (([DateTimeOffset]::UtcNow - $lastLog).TotalSeconds -ge 60) {
+              Write-Host '----- Cloud Games log -----'
+              Get-Content $outLog -Tail 30 -ErrorAction SilentlyContinue
+              Get-Content $errLog -Tail 30 -ErrorAction SilentlyContinue
+              $left = [math]::Floor(($end - [DateTimeOffset]::UtcNow).TotalMinutes)
+              Write-Host "⏳ Còn khoảng $left phút"
+              $lastLog = [DateTimeOffset]::UtcNow
+            }
+            Start-Sleep -Seconds 10
+          }
+          Write-Host '🎯 Hết thời gian phiên.'
+
+      - name: 🧹 Dọn dẹp
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: 🔁 Tự tạo phiên tiếp theo
+        if: ${{ always() && env.AUTO_RESTART == 'true' && steps.bot.outcome == 'success' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}" -f duration="${{ env.DURATION }}" -f auto_restart=true
+          if ($LASTEXITCODE -ne 0) { throw 'Không kích hoạt được phiên tiếp theo' }
+          Write-Host '✅ Đã kích hoạt phiên Cloud Games tiếp theo.'
